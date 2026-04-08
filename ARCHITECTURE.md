@@ -10,7 +10,7 @@ DB[(PostgreSQL)]
 Cache[(Redis)]
 
 Worker["Celery Worker"]
-Queue["Message Broker\n(Kafka / RabbitMQ)"]
+Queue["Message Broker\n(RabbitMQ)"]
 
 EventService["Event Processor\n(Consumer)"]
 Ranking["Ranking Service"]
@@ -35,7 +35,7 @@ API --> Queue
 Queue --> EventService
 EventService --> DB
 
-API --> Worker
+Queue --> Worker
 Worker --> DB
 Worker --> Cache
 
