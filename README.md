@@ -1,5 +1,41 @@
 ## Техническое задание: Dating бот
 
+## Запуск (этап 2: бот + регистрация)
+
+### Что реализовано
+- **Bot**: команды `/start`, `/help` (polling)
+- **Backend API**: `POST /users/telegram/upsert` (upsert по `telegram_id`)
+- **БД**: Postgres в `docker-compose`
+
+### Быстрый старт
+1) Создай файл `.env` на базе примера:
+
+```bash
+cp .env.example .env
+```
+
+2) В `.env` заполни `TELEGRAM_BOT_TOKEN`.
+
+3) Подними сервисы:
+
+```bash
+docker compose up --build
+```
+
+4) Открой бота в Telegram и отправь `/start`.
+
+### Проверка API вручную (опционально)
+- **Healthcheck**: `GET http://localhost:8000/health`
+- **Upsert**: `POST http://localhost:8000/users/telegram/upsert`
+
+Пример:
+
+```bash
+curl -X POST "http://localhost:8000/users/telegram/upsert" \
+  -H "Content-Type: application/json" \
+  -d '{"telegram_id":123,"username":"test","first_name":"Test","language":"ru"}'
+```
+
 ### 1. Общее описание
 
 **Цель проекта**: разработать систему дейтинг‑бота (на базе Telegram), которая позволяет пользователям создавать анкеты, получать ранжированные предложения анкет других пользователей и взаимодействовать через мэтчи и диалоги.
