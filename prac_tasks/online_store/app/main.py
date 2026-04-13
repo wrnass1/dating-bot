@@ -255,7 +255,7 @@ def main() -> None:
     )
     print_state(engine, order_id=order_id)
 
-    print("\n--- Scenario 3: add product (transaction) ---")
+    print("\n Сценарий 3: добавление продукта")
     pid = upsert_product(engine, name="USB-C Cable", price=Decimal("9.99"))
     print(f"\nInserted product id: {pid}")
     print_state(engine, order_id=order_id)
