@@ -7,27 +7,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 
 
-def env(name: str, default: str | None = None) -> str:
-    v = os.getenv(name, default)
-    if v is None or v == "":
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
-
-
-def wait_for_db(engine, timeout_s: int = 60) -> None:
-    deadline = time.time() + timeout_s
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            return
-        except OperationalError as e:
-            last_err = e
-            time.sleep(1)
-    raise RuntimeError(f"DB not ready after {timeout_s}s: {last_err}")
-
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS Customers (
   CustomerID  SERIAL PRIMARY KEY,
@@ -60,11 +39,31 @@ CREATE TABLE IF NOT EXISTS OrderItems (
 """
 
 
-def seed_minimal(engine) -> None:
+def must_env(name: str, default: str | None = None) -> str:
+    value = os.getenv(name, default)
+    if not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
+
+
+def wait_for_db(engine, timeout_s: int) -> None:
+    deadline = time.time() + timeout_s
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return
+        except OperationalError as e:
+            last_err = e
+            time.sleep(1)
+    raise RuntimeError(f"DB not ready after {timeout_s}s: {last_err}")
+
+
+def seed(engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(SCHEMA_SQL))
 
-        # Seed customers
         conn.execute(
             text(
                 """
@@ -76,12 +75,12 @@ def seed_minimal(engine) -> None:
             {"fn": "Ivan", "ln": "Petrov", "email": "ivan.petrov@example.com"},
         )
 
-        # Seed products
-        for name, price in [
+        base_products = [
             ("Keyboard", Decimal("50.00")),
             ("Mouse", Decimal("25.00")),
             ("Monitor", Decimal("200.00")),
-        ]:
+        ]
+        for name, price in base_products:
             conn.execute(
                 text(
                     """
@@ -94,20 +93,13 @@ def seed_minimal(engine) -> None:
             )
 
 
-def scenario_1_place_order(engine) -> int:
-    """
-    Scenario 1:
-      1) Insert into Orders
-      2) Insert rows into OrderItems with Quantity + Subtotal
-      3) Update Orders.TotalAmount = SUM(OrderItems.Subtotal)
-    """
-    customer_email = "ivan.petrov@example.com"
+def money(value) -> Decimal:
+    return Decimal(value).quantize(Decimal("0.01"))
 
-    # Example order: 2x Keyboard, 1x Mouse
-    items = [
-        {"product_name": "Keyboard", "qty": 2},
-        {"product_name": "Mouse", "qty": 1},
-    ]
+
+def place_order(engine, customer_email: str, items: list[tuple[str, int]]) -> int:
+    if not items:
+        raise ValueError("Order must contain at least one item")
 
     with engine.begin() as conn:
         customer_id = conn.execute(
@@ -126,20 +118,22 @@ def scenario_1_place_order(engine) -> int:
             {"cid": customer_id, "od": datetime.utcnow()},
         ).scalar_one()
 
-        for item in items:
-            product = conn.execute(
+        total = Decimal("0.00")
+        for product_name, qty in items:
+            row = conn.execute(
                 text(
                     """
-                    SELECT ProductID, Price
+                    SELECT ProductID AS product_id, Price AS price
                     FROM Products
                     WHERE ProductName = :name
                     FOR UPDATE
                     """
                 ),
-                {"name": item["product_name"]},
+                {"name": product_name},
             ).mappings().one()
 
-            subtotal = (Decimal(product["price"]) * Decimal(item["qty"])).quantize(Decimal("0.01"))
+            subtotal = money(Decimal(row["price"]) * Decimal(qty))
+            total += subtotal
             conn.execute(
                 text(
                     """
@@ -147,32 +141,19 @@ def scenario_1_place_order(engine) -> int:
                     VALUES (:oid, :pid, :qty, :subtotal)
                     """
                 ),
-                {"oid": order_id, "pid": product["productid"], "qty": item["qty"], "subtotal": subtotal},
+                {"oid": order_id, "pid": row["product_id"], "qty": qty, "subtotal": subtotal},
             )
-
-        total = conn.execute(
-            text("SELECT COALESCE(SUM(Subtotal), 0) FROM OrderItems WHERE OrderID = :oid"),
-            {"oid": order_id},
-        ).scalar_one()
 
         conn.execute(
             text("UPDATE Orders SET TotalAmount = :total WHERE OrderID = :oid"),
-            {"total": total, "oid": order_id},
+            {"total": money(total), "oid": order_id},
         )
 
     return int(order_id)
 
 
-def scenario_2_update_customer_email(engine) -> None:
-    """
-    Scenario 2:
-      Atomic update of customer email.
-    """
-    old_email = "ivan.petrov@example.com"
-    new_email = "ivan.petrov+updated@example.com"
-
+def update_customer_email(engine, old_email: str, new_email: str) -> None:
     with engine.begin() as conn:
-        # Lock whichever record exists (old or already-updated email)
         customer_id = conn.execute(
             text(
                 """
@@ -193,11 +174,7 @@ def scenario_2_update_customer_email(engine) -> None:
         )
 
 
-def scenario_3_add_product(engine) -> int:
-    """
-    Scenario 3:
-      Atomic insert of a new product.
-    """
+def upsert_product(engine, name: str, price: Decimal) -> int:
     with engine.begin() as conn:
         product_id = conn.execute(
             text(
@@ -208,7 +185,7 @@ def scenario_3_add_product(engine) -> int:
                 RETURNING ProductID
                 """
             ),
-            {"name": "USB-C Cable", "price": Decimal("9.99")},
+            {"name": name, "price": money(price)},
         ).scalar_one()
     return int(product_id)
 
@@ -256,22 +233,30 @@ def print_state(engine, order_id: int | None = None) -> None:
 
 
 def main() -> None:
-    db_url = env("DATABASE_URL")
+    db_url = must_env("DATABASE_URL")
     engine = create_engine(db_url, pool_pre_ping=True, future=True)
     wait_for_db(engine, timeout_s=int(os.getenv("DB_WAIT_TIMEOUT_S", "60")))
 
-    seed_minimal(engine)
+    seed(engine)
 
-    print("\n--- Scenario 1: place order (transaction) ---")
-    order_id = scenario_1_place_order(engine)
+    print("\n Сценарий 1: размещение заказа (транзакция)")
+    order_id = place_order(
+        engine,
+        customer_email="ivan.petrov@example.com",
+        items=[("Keyboard", 2), ("Mouse", 1)],
+    )
     print_state(engine, order_id=order_id)
 
-    print("\n--- Scenario 2: update customer email (transaction) ---")
-    scenario_2_update_customer_email(engine)
+    print("\n Сценарий 2: обновление email клиента (транзакция)")
+    update_customer_email(
+        engine,
+        old_email="ivan.petrov@example.com",
+        new_email="ivan.petrov+updated@example.com",
+    )
     print_state(engine, order_id=order_id)
 
     print("\n--- Scenario 3: add product (transaction) ---")
-    pid = scenario_3_add_product(engine)
+    pid = upsert_product(engine, name="USB-C Cable", price=Decimal("9.99"))
     print(f"\nInserted product id: {pid}")
     print_state(engine, order_id=order_id)
 
