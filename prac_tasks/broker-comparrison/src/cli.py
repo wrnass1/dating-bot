@@ -111,15 +111,13 @@ def matrix_cmd(
     _ensure_parent(out_csv)
     _ensure_parent(out_jsonl)
 
-    writer: csv.DictWriter | None = None
     fieldnames: list[str] | None = None
-
-    try:
-        with out_jsonl.open("a", encoding="utf-8") as jf, out_csv.open("w", newline="", encoding="utf-8") as cf:
+    with out_jsonl.open("a", encoding="utf-8") as jf, out_csv.open("a", newline="", encoding="utf-8") as cf:
+        w: csv.DictWriter | None = None
+        try:
             for broker in ("rabbitmq", "redis"):
                 for pbytes in payloads:
                     for target in rps_values:
-                        click.echo(f"Run broker={broker} payload={pbytes}B rps={target} ...", err=True)
                         cfg = RunConfig(
                             broker=broker,
                             duration_s=duration_s,
@@ -134,16 +132,15 @@ def matrix_cmd(
                         jf.write(json.dumps(row, ensure_ascii=False) + "\n")
                         jf.flush()
 
-                        if writer is None:
+                        if fieldnames is None:
                             fieldnames = list(row.keys())
-                            writer = csv.DictWriter(cf, fieldnames=fieldnames)
-                            writer.writeheader()
-                            cf.flush()
-
-                        writer.writerow(row)
+                            w = csv.DictWriter(cf, fieldnames=fieldnames)
+                            w.writeheader()
+                        assert w is not None
+                        w.writerow(row)
                         cf.flush()
-    except (KeyboardInterrupt, click.Abort):
-        click.echo("Aborted. Partial results (if any) were saved.", err=True)
+        except KeyboardInterrupt:
+            click.echo("Aborted by user, partial results were saved.")
 
     click.echo(f"Wrote {out_csv}")
     click.echo(f"Wrote {out_jsonl}")

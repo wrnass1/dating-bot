@@ -91,7 +91,12 @@ async def run_benchmark(cfg: RunConfig) -> BenchResult:
         async def consumer_task(consumer_idx: int) -> None:
             c = await broker.create_consumer()
             try:
-                async for message in c.iter_messages():
+                # bounded queue.get() avoids hanging on iterator shutdown
+                while not stop.is_set():
+                    try:
+                        message = await c.get(timeout_s=1.0)
+                    except asyncio.TimeoutError:
+                        continue
                     try:
                         sent_ns, _seq, _payload = parse_message_bytes(message.body)
                         latency_ms = (monotonic_time_ns() - sent_ns) / 1_000_000.0
@@ -104,8 +109,6 @@ async def run_benchmark(cfg: RunConfig) -> BenchResult:
                             await message.nack(requeue=True)
                         except Exception:  # noqa: BLE001
                             pass
-                    if stop.is_set():
-                        break
             finally:
                 await c.close()
 
@@ -170,13 +173,14 @@ async def run_benchmark(cfg: RunConfig) -> BenchResult:
     finally:
         stop.set()
 
-    # When matrix is interrupted (Ctrl+C), we want to exit quickly and avoid
-    # leaving pending aio-pika/aiormq tasks behind. Cancelling here is safe
-    # because this is a benchmark tool.
-    for t in producers + consumers:
-        t.cancel()
     await asyncio.gather(*producers, return_exceptions=True)
-    await asyncio.gather(*consumers, return_exceptions=True)
+    # Don't let consumers hang forever after producers stop
+    try:
+        await asyncio.wait_for(asyncio.gather(*consumers, return_exceptions=True), timeout=5.0)
+    except asyncio.TimeoutError:
+        for t in consumers:
+            t.cancel()
+        await asyncio.gather(*consumers, return_exceptions=True)
     elapsed = time.perf_counter() - t0
 
     lat_samples = reservoir.snapshot()

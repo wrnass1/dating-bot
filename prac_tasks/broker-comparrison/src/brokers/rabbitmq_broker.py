@@ -16,7 +16,12 @@ class RabbitMQBroker:
         connection = await aio_pika.connect_robust(self.url)
         try:
             channel = await connection.channel()
-            await channel.declare_queue(self.queue_name, durable=False, auto_delete=False)
+            queue = await channel.declare_queue(self.queue_name, durable=False, auto_delete=False)
+            # Keep runs comparable: start from empty queue
+            try:
+                await queue.purge()
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             await connection.close()
 
@@ -75,6 +80,9 @@ class RabbitMQConsumer:
         async with self.queue.iterator() as queue_iter:
             async for message in queue_iter:
                 yield message
+
+    async def get(self, timeout_s: float = 1.0):
+        return await self.queue.get(timeout=timeout_s)
 
     async def close(self) -> None:
         await self.connection.close()

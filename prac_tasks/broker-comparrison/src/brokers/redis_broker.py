@@ -16,10 +16,15 @@ class RedisStreamBroker:
     async def setup(self) -> None:
         r: RedisClient = Redis.from_url(self.url, decode_responses=False)
         try:
-            # Create stream+group idempotently
+            # Keep runs comparable: start from empty stream, recreate group
+            try:
+                await r.delete(self.stream)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 await r.xgroup_create(name=self.stream, groupname=self.group, id="0-0", mkstream=True)
             except Exception:  # noqa: BLE001
+                # Group may already exist; ignore
                 pass
         finally:
             await r.aclose()
