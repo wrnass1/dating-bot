@@ -170,6 +170,8 @@ async def run_benchmark(cfg: RunConfig) -> BenchResult:
     t0 = time.perf_counter()
     try:
         await asyncio.sleep(cfg.duration_s)
+    except asyncio.CancelledError:
+        raise
     finally:
         stop.set()
 

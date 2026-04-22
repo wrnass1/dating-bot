@@ -5,6 +5,7 @@ import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 import click
 
@@ -76,6 +77,12 @@ def run_cmd(
 
 @cli.command("matrix")
 @click.option("--duration-s", type=float, default=20.0, show_default=True)
+@click.option(
+    "--budget-s",
+    type=float,
+    default=None,
+    help="Total time budget for the whole matrix (seconds). If set, per-run duration is auto-reduced to fit roughly within the budget.",
+)
 @click.option("--producers", type=int, default=1, show_default=True)
 @click.option("--consumers", type=int, default=1, show_default=True)
 @click.option(
@@ -92,17 +99,28 @@ def run_cmd(
     show_default=True,
     help="Comma-separated target message/sec values",
 )
+@click.option(
+    "--quick",
+    is_flag=True,
+    help="Quick preset: payload-bytes=128,10240 and rps=1000,10000 (still runs both brokers).",
+)
 @click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path), default=Path("results"))
 def matrix_cmd(
     duration_s: float,
+    budget_s: float | None,
     producers: int,
     consumers: int,
     payload_bytes: str,
     rps: str,
+    quick: bool,
     out_dir: Path,
 ) -> None:
-    payloads = [int(x.strip()) for x in payload_bytes.split(",") if x.strip()]
-    rps_values = [int(x.strip()) for x in rps.split(",") if x.strip()]
+    if quick:
+        payloads = [128, 10240]
+        rps_values = [1000, 10000]
+    else:
+        payloads = [int(x.strip()) for x in payload_bytes.split(",") if x.strip()]
+        rps_values = [int(x.strip()) for x in rps.split(",") if x.strip()]
     stamp = _utc_stamp()
 
     out_dir = out_dir.resolve()
@@ -111,34 +129,62 @@ def matrix_cmd(
     _ensure_parent(out_csv)
     _ensure_parent(out_jsonl)
 
+    plan = [(broker, pbytes, target) for broker in ("rabbitmq", "redis") for pbytes in payloads for target in rps_values]
+    total = len(plan)
+
+    # Fit into a rough wall-time budget by shrinking per-run duration.
+    # Overhead exists (connections, setup), so we aim at ~80% of the budget for sleep time.
+    if budget_s is not None and budget_s > 0 and total > 0:
+        target_per_run = max(0.5, (budget_s * 0.8) / total)
+        if target_per_run < duration_s:
+            duration_s = target_per_run
+
+    click.echo(f"Planned runs: {total} (brokers=2 × payloads={len(payloads)} × rps={len(rps_values)})")
+    click.echo(f"Expected wall time (rough): ~{total * duration_s:.0f}s + overhead")
+
     fieldnames: list[str] | None = None
     with out_jsonl.open("a", encoding="utf-8") as jf, out_csv.open("a", newline="", encoding="utf-8") as cf:
         w: csv.DictWriter | None = None
         try:
-            for broker in ("rabbitmq", "redis"):
-                for pbytes in payloads:
-                    for target in rps_values:
-                        cfg = RunConfig(
-                            broker=broker,
-                            duration_s=duration_s,
-                            producers=producers,
-                            consumers=consumers,
-                            target_msg_per_sec=target,
-                            payload_bytes=pbytes,
-                        )
-                        result = asyncio.run(run_benchmark(cfg))
-                        row = result.to_dict()
+            t_all0 = perf_counter()
+            for idx, (broker, pbytes, target) in enumerate(plan, start=1):
+                t0 = perf_counter()
+                click.echo(f"[{idx}/{total}] broker={broker} payload={pbytes}B rps={target} duration={duration_s}s ...")
 
-                        jf.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        jf.flush()
+                cfg = RunConfig(
+                    broker=broker,
+                    duration_s=duration_s,
+                    producers=producers,
+                    consumers=consumers,
+                    target_msg_per_sec=target,
+                    payload_bytes=pbytes,
+                )
+                try:
+                    result = asyncio.run(run_benchmark(cfg))
+                except KeyboardInterrupt:
+                    click.echo("Aborted by user, partial results were saved.")
+                    break
 
-                        if fieldnames is None:
-                            fieldnames = list(row.keys())
-                            w = csv.DictWriter(cf, fieldnames=fieldnames)
-                            w.writeheader()
-                        assert w is not None
-                        w.writerow(row)
-                        cf.flush()
+                row = result.to_dict()
+
+                jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                jf.flush()
+
+                if fieldnames is None:
+                    fieldnames = list(row.keys())
+                    w = csv.DictWriter(cf, fieldnames=fieldnames)
+                    w.writeheader()
+                assert w is not None
+                w.writerow(row)
+                cf.flush()
+
+                elapsed_one = perf_counter() - t0
+                elapsed_all = perf_counter() - t_all0
+                remaining = total - idx
+                eta = (elapsed_all / idx) * remaining if idx else 0.0
+                click.echo(
+                    f"  done in {elapsed_one:.1f}s; processed={row.get('processed')} throughput={float(row.get('throughput_msg_s', 0.0)):.1f} msg/s; ETA ~{eta:.0f}s"
+                )
         except KeyboardInterrupt:
             click.echo("Aborted by user, partial results were saved.")
 
