@@ -3,7 +3,14 @@ import logging
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeDefault,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -45,6 +52,37 @@ async def main() -> None:
     dp = Dispatcher()
     api = ApiClient(settings.api_base_url)
 
+    # Telegram "menu commands" (the built-in command list near the input field).
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Регистрация"),
+            BotCommand(command="help", description="Помощь и список команд"),
+            BotCommand(command="menu", description="Меню кнопок"),
+            BotCommand(command="profile", description="Создать/обновить анкету"),
+            BotCommand(command="me", description="Показать мою анкету"),
+            BotCommand(command="feed", description="Лента анкет"),
+            BotCommand(command="ping", description="Проверка: pong"),
+        ],
+        scope=BotCommandScopeDefault(),
+    )
+
+    def _main_menu_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📝 Анкета", callback_data="menu:profile"),
+                    InlineKeyboardButton(text="👤 Моя анкета", callback_data="menu:me"),
+                ],
+                [
+                    InlineKeyboardButton(text="📰 Лента", callback_data="menu:feed"),
+                    InlineKeyboardButton(text="ℹ️ Помощь", callback_data="menu:help"),
+                ],
+            ]
+        )
+
+    async def _show_menu(message: Message) -> None:
+        await message.answer("Меню:", reply_markup=_main_menu_kb())
+
     @dp.message(Command("start"))
     async def start(message: Message) -> None:
         tg = message.from_user
@@ -65,6 +103,11 @@ async def main() -> None:
             return
 
         await message.answer(_format_welcome(bool(result.get("is_new"))))
+        await _show_menu(message)
+
+    @dp.message(Command("menu"))
+    async def menu_cmd(message: Message) -> None:
+        await _show_menu(message)
 
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
@@ -286,6 +329,36 @@ async def main() -> None:
 
         if call.message:
             await _send_next_feed(call.message, api)
+
+    @dp.callback_query(F.data.startswith("menu:"))
+    async def on_menu_action(call: CallbackQuery) -> None:
+        tg = call.from_user
+        if tg is None:
+            return
+        action = (call.data or "").split(":", 1)[1] if call.data else ""
+        if action == "profile":
+            await call.answer()
+            if call.message:
+                state = dp.fsm.get_context(bot=bot, chat_id=call.message.chat.id, user_id=tg.id)
+                await profile_start(call.message, state=state)
+            return
+        if action == "me":
+            await call.answer()
+            if call.message:
+                await me(call.message)
+            return
+        if action == "feed":
+            await call.answer()
+            if call.message:
+                await feed(call.message)
+            return
+        if action == "help":
+            await call.answer()
+            if call.message:
+                await help_cmd(call.message)
+            return
+
+        await call.answer("Неизвестная кнопка")
 
     try:
         await dp.start_polling(bot)
