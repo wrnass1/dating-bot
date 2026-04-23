@@ -14,7 +14,7 @@
 cp .env.example .env
 ```
 
-2) В `.env` заполни `TELEGRAM_BOT_TOKEN`.
+2) В `.env` заполни `TELEGRAM_BOT_TOKEN` (иначе бот не стартует).
 
 3) Подними сервисы:
 
@@ -25,13 +25,16 @@ docker compose up --build
 4) Открой бота в Telegram и отправь `/start`.
 
 ### Проверка API вручную (опционально)
-- **Healthcheck**: `GET http://localhost:8000/health`
-- **Upsert**: `POST http://localhost:8000/users/telegram/upsert`
+- **Healthcheck**: `GET http://localhost:18000/health`
+- **Upsert**: `POST http://localhost:18000/users/telegram/upsert`
+- **Profile upsert**: `POST http://localhost:18000/profiles/upsert`
+- **Feed next**: `POST http://localhost:18000/feed/next`
+- **Interaction**: `POST http://localhost:18000/interactions`
 
 Пример:
 
 ```bash
-curl -X POST "http://localhost:8000/users/telegram/upsert" \
+curl -X POST "http://localhost:18000/users/telegram/upsert" \
   -H "Content-Type: application/json" \
   -d '{"telegram_id":123,"username":"test","first_name":"Test","language":"ru"}'
 ```

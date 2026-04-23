@@ -29,3 +29,26 @@ class ApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def upsert_profile(self, *, telegram_id: int, **fields) -> dict:
+        resp = await self._client.post("/profiles/upsert", json={"telegram_id": telegram_id, **fields})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_profile(self, *, telegram_id: int) -> dict:
+        resp = await self._client.get(f"/profiles/by_telegram/{telegram_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def feed_next(self, *, telegram_id: int) -> dict:
+        resp = await self._client.post("/feed/next", json={"telegram_id": telegram_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def interact(self, *, telegram_id: int, to_profile_id: str, action: str) -> dict:
+        resp = await self._client.post(
+            "/interactions",
+            json={"telegram_id": telegram_id, "to_profile_id": to_profile_id, "action": action},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
