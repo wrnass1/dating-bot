@@ -52,3 +52,11 @@ class ApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def feed_action(self, *, telegram_id: int, to_profile_id: str, action: str) -> dict:
+        resp = await self._client.post(
+            "/feed/action",
+            json={"telegram_id": telegram_id, "to_profile_id": to_profile_id, "action": action},
+        )
+        resp.raise_for_status()
+        return resp.json()
+

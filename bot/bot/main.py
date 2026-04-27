@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramNetworkError
+import httpx
 from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
@@ -69,6 +70,43 @@ async def main() -> None:
                 last_exc = e
                 await asyncio.sleep(0.8 * (attempt + 1))
         logger.exception("Failed to send message after retries", exc_info=last_exc)
+
+    async def safe_callback_answer(call: CallbackQuery, text: str | None = None) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                await call.answer(text)
+                return
+            except TelegramNetworkError as e:
+                last_exc = e
+                await asyncio.sleep(0.6 * (attempt + 1))
+        logger.exception("Failed to answer callback after retries", exc_info=last_exc)
+
+    async def safe_send_to_telegram_id(telegram_id: int, text: str) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                await bot.send_message(chat_id=telegram_id, text=text)
+                return
+            except TelegramNetworkError as e:
+                last_exc = e
+                await asyncio.sleep(0.8 * (attempt + 1))
+            except Exception as e:
+                # Most common: user never started the bot / blocked it.
+                logger.info("Failed to notify user %s: %s", telegram_id, type(e).__name__)
+                return
+        logger.exception("Failed to notify user after retries", exc_info=last_exc)
+
+    def _respond_kb(from_profile_id: str, from_telegram_id: int) -> InlineKeyboardMarkup:
+        # Buttons for the user who received a like.
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="👍 Взаимно", callback_data=f"resp:like:{from_profile_id}:{from_telegram_id}"),
+                    InlineKeyboardButton(text="👎 Продинамить", callback_data=f"resp:skip:{from_profile_id}:{from_telegram_id}"),
+                ]
+            ]
+        )
 
     # Telegram "menu commands" (the built-in command list near the input field).
     await bot.set_my_commands(
@@ -290,12 +328,12 @@ async def main() -> None:
 
         await safe_answer(message, "Анкета сохранена! Теперь можно открыть /feed.")
 
-    def _feed_kb(profile_id: str) -> InlineKeyboardMarkup:
+    def _feed_kb(profile_id: str, target_telegram_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="👍 Like", callback_data=f"like:{profile_id}"),
-                    InlineKeyboardButton(text="➡️ Skip", callback_data=f"skip:{profile_id}"),
+                    InlineKeyboardButton(text="👍 Like", callback_data=f"like:{profile_id}:{target_telegram_id}"),
+                    InlineKeyboardButton(text="➡️ Skip", callback_data=f"skip:{profile_id}:{target_telegram_id}"),
                 ]
             ]
         )
@@ -311,16 +349,39 @@ async def main() -> None:
             f"\nScore: {card.get('combined_score'):.1f}"
         )
 
+    def _format_feed_error(exc: Exception) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            try:
+                detail = exc.response.json().get("detail")
+            except Exception:
+                detail = exc.response.text
+
+            if exc.response.status_code == 400:
+                return f"Не могу показать ленту: {detail}"
+            if exc.response.status_code == 404:
+                if detail == "No profiles found":
+                    return (
+                        "Пока нет доступных анкет для показа.\n\n"
+                        "Чтобы лента работала, нужна хотя бы 1 анкета другого пользователя."
+                    )
+                return str(detail)
+            return f"Ошибка API ({exc.response.status_code}): {detail}"
+        return "Ошибка. Попробуй ещё раз позже."
+
     async def _send_next_feed(message: Message, api: ApiClient) -> None:
         tg = message.from_user
         if tg is None:
             return
         try:
             card = await api.feed_next(telegram_id=tg.id)
-        except Exception:
-            await safe_answer(message, "Лента пуста или анкета не создана. Сначала сделай /profile.")
+        except Exception as e:
+            await safe_answer(message, _format_feed_error(e))
             return
-        await safe_answer(message, _format_feed_card(card), reply_markup=_feed_kb(card["profile_id"]))
+        await safe_answer(
+            message,
+            _format_feed_card(card),
+            reply_markup=_feed_kb(card["profile_id"], int(card["telegram_id"])),
+        )
 
     @dp.message(Command("feed"))
     async def feed(message: Message) -> None:
@@ -332,22 +393,113 @@ async def main() -> None:
         if tg is None:
             return
         data = call.data or ""
-        action, profile_id = data.split(":", 1)
+        parts = data.split(":")
+        if len(parts) < 3:
+            await safe_callback_answer(call, "Кнопка устарела. Нажми /feed ещё раз.")
+            return
+        action, profile_id, target_tg_id_raw = parts[0], parts[1], parts[2]
         try:
-            res = await api.interact(telegram_id=tg.id, to_profile_id=profile_id, action=action)
+            target_tg_id = int(target_tg_id_raw)
+        except Exception:
+            target_tg_id = 0
+        try:
+            res = await api.feed_action(telegram_id=tg.id, to_profile_id=profile_id, action=action)
         except Exception:
             logger.exception("Failed to send interaction")
-            await call.answer("Ошибка. Попробуй ещё раз.")
+            await safe_callback_answer(call, "Ошибка. Попробуй ещё раз.")
             return
 
-        if res.get("is_match"):
-            await call.answer("Мэтч!")
-            await call.message.answer("У вас мэтч! Можешь написать человеку в Telegram, если знаешь его контакт.")
+        if action == "like":
+            await safe_callback_answer(call, "Лайк отправлен")
+            if target_tg_id:
+                # We need viewer's profile_id so the other user can react.
+                viewer_profile_id = ""
+                try:
+                    viewer_prof = await api.get_profile(telegram_id=tg.id)
+                    viewer_profile_id = str(viewer_prof.get("profile_id") or "")
+                except Exception:
+                    viewer_profile_id = ""
+
+                await safe_send_to_telegram_id(
+                    target_tg_id,
+                    "Кто-то поставил лайк вашей анкете. Хотите ответить взаимностью?",
+                )
+                if viewer_profile_id:
+                    try:
+                        await bot.send_message(
+                            chat_id=target_tg_id,
+                            text="Ответить на лайк:",
+                            reply_markup=_respond_kb(viewer_profile_id, int(tg.id)),
+                        )
+                    except Exception:
+                        # Best-effort: notification is optional.
+                        pass
         else:
-            await call.answer("Ок")
+            await safe_callback_answer(call, "Пропуск")
+
+        if res.get("is_match"):
+            await safe_callback_answer(call, "Мэтч!")
+            if call.message:
+                await safe_answer(
+                    call.message,
+                    "У вас мэтч! Можешь написать человеку в Telegram, если знаешь его контакт.",
+                )
+            if target_tg_id:
+                await safe_send_to_telegram_id(
+                    target_tg_id,
+                    "У вас мэтч! Откройте бота и посмотрите ленту.",
+                )
 
         if call.message:
-            await _send_next_feed(call.message, api)
+            nxt = res.get("next")
+            if not nxt:
+                await safe_answer(
+                    call.message,
+                    "Анкеты закончились (или пока больше нет доступных анкет).",
+                )
+                return
+            await safe_answer(
+                call.message,
+                _format_feed_card(nxt),
+                reply_markup=_feed_kb(nxt["profile_id"], int(nxt["telegram_id"])),
+            )
+
+    @dp.callback_query(F.data.startswith("resp:"))
+    async def on_like_response(call: CallbackQuery) -> None:
+        """
+        Reaction to a received like: like back or skip.
+        callback_data: resp:<action>:<to_profile_id>:<from_telegram_id>
+        """
+        tg = call.from_user
+        if tg is None:
+            return
+        parts = (call.data or "").split(":")
+        if len(parts) < 4:
+            await safe_callback_answer(call, "Кнопка устарела.")
+            return
+        _, action, to_profile_id, from_tg_raw = parts[0], parts[1], parts[2], parts[3]
+        try:
+            from_tg_id = int(from_tg_raw)
+        except Exception:
+            from_tg_id = 0
+
+        try:
+            res = await api.interact(telegram_id=tg.id, to_profile_id=to_profile_id, action=action)
+        except Exception:
+            logger.exception("Failed to respond to like")
+            await safe_callback_answer(call, "Не получилось отправить ответ. Попробуй позже.")
+            return
+
+        if action == "like":
+            await safe_callback_answer(call, "Отправлено: взаимно")
+        else:
+            await safe_callback_answer(call, "Ок")
+
+        if res.get("is_match"):
+            if call.message:
+                await safe_answer(call.message, "У вас мэтч!")
+            if from_tg_id:
+                await safe_send_to_telegram_id(from_tg_id, "У вас мэтч! Откройте бота.")
 
     @dp.callback_query(F.data.startswith("menu:"))
     async def on_menu_action(call: CallbackQuery) -> None:

@@ -2,13 +2,17 @@ import json
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import and_, desc, or_, select
+from sqlalchemy import and_, delete, desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
 from app.models import Interaction, Match, Profile, Rating, User
 from app.ranking import upsert_rating_for_pair
 from app.schemas import (
+    DevResetUserStateIn,
+    DevResetUserStateOut,
+    FeedActionIn,
+    FeedActionOut,
     FeedNextIn,
     FeedProfileOut,
     InteractionIn,
@@ -226,6 +230,7 @@ def feed_next(payload: FeedNextIn, db: Session = Depends(get_db)) -> FeedProfile
     return FeedProfileOut(
         profile_id=str(prof.id),
         user_id=str(prof.user_id),
+        telegram_id=int(prof.user.telegram_id),
         age=prof.age,
         gender=prof.gender,
         city=prof.city,
@@ -285,3 +290,50 @@ def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) ->
 
     db.commit()
     return InteractionOut(ok=True, is_match=is_match)
+
+
+@app.post("/feed/action", response_model=FeedActionOut)
+def feed_action(payload: FeedActionIn, db: Session = Depends(get_db)) -> FeedActionOut:
+    """
+    Convenience endpoint for the bot UI: record like/skip and return next feed card.
+    This prevents the bot from needing to call two endpoints in sequence.
+    """
+    res = create_interaction(InteractionIn(**payload.model_dump()), db=db)
+    try:
+        nxt = feed_next(FeedNextIn(telegram_id=payload.telegram_id), db=db)
+    except HTTPException as e:
+        if e.status_code == 404:
+            return FeedActionOut(ok=bool(res.ok), is_match=bool(res.is_match), next=None)
+        raise
+    return FeedActionOut(ok=bool(res.ok), is_match=bool(res.is_match), next=nxt)
+
+
+@app.post("/dev/reset_user_state", response_model=DevResetUserStateOut)
+def dev_reset_user_state(payload: DevResetUserStateIn, db: Session = Depends(get_db)) -> DevResetUserStateOut:
+    """
+    Dev helper: clear user's swipe history and cached feed.
+    - deletes outgoing interactions (like/skip)
+    - deletes matches involving the user
+    - clears Redis feed list for this user
+    """
+    user = _get_user_by_telegram(db, payload.telegram_id)
+
+    deleted_interactions = db.execute(delete(Interaction).where(Interaction.from_user_id == user.id)).rowcount or 0
+    deleted_matches = (
+        db.execute(delete(Match).where(or_(Match.user_a_id == user.id, Match.user_b_id == user.id))).rowcount or 0
+    )
+    db.commit()
+
+    # Clear cached feed for this user (best-effort).
+    try:
+        r = _get_redis()
+        r.delete(_feed_key(user.id))
+        r.delete(_feed_meta_key(user.id))
+    except Exception:
+        pass
+
+    return DevResetUserStateOut(
+        ok=True,
+        deleted_interactions=int(deleted_interactions),
+        deleted_matches=int(deleted_matches),
+    )
