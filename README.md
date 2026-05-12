@@ -1,11 +1,15 @@
 ## Техническое задание: Dating бот
 
-## Запуск (этап 2: бот + регистрация)
+## Запуск (этап 4: бот + API + Redis + Celery)
 
 ### Что реализовано
-- **Bot**: команды `/start`, `/help` (polling)
-- **Backend API**: `POST /users/telegram/upsert` (upsert по `telegram_id`)
-- **БД**: Postgres в `docker-compose`
+- **Bot**: `/start`, `/help`, `/menu`, `/profile`, `/me`, `/feed`, лайк/скип, уведомление о взаимном лайке.
+- **Backend API**: регистрация Telegram-пользователей, анкеты, лента, interactions, matches.
+- **Ранжирование**: глобальный рейтинг анкеты + персональный feed-score под предпочтения смотрящего.
+- **Redis**: кэш батча ленты и текущей карточки с TTL.
+- **Celery**: периодический пересчёт рейтингов и обслуживание stale feed cache.
+- **БД**: Postgres с индексами и ограничениями целостности.
+- **Тесты**: продуктовые pytest-сценарии для ленты, лайков, мэтчей и рейтинга.
 
 ### Быстрый старт
 1) Создай файл `.env` на базе примера:
@@ -15,6 +19,7 @@ cp .env.example .env
 ```
 
 2) В `.env` заполни `TELEGRAM_BOT_TOKEN` (иначе бот не стартует).
+Опционально задай `API_SERVICE_TOKEN`; если он установлен, bot и API будут общаться через заголовок `X-API-Token`.
 
 3) Подними сервисы:
 
@@ -24,12 +29,32 @@ docker compose up --build
 
 4) Открой бота в Telegram и отправь `/start`.
 
+### Проверка тестов
+
+```bash
+cd backend
+PYTHONPYCACHEPREFIX=/private/tmp/dating_bot_pycache python -m pytest tests
+```
+
+### Фоновые задачи Celery
+
+В `docker compose` поднимается сервис `worker`, который запускает Celery worker вместе с beat:
+
+- `app.tasks.recalculate_all_ratings` — пересчитывает глобальные rating snapshots активных анкет.
+- `app.tasks.clear_stale_feed_cache` — выставляет TTL старым Redis-ключам ленты.
+
 ### Проверка API вручную (опционально)
 - **Healthcheck**: `GET http://localhost:18000/health`
 - **Upsert**: `POST http://localhost:18000/users/telegram/upsert`
 - **Profile upsert**: `POST http://localhost:18000/profiles/upsert`
 - **Feed next**: `POST http://localhost:18000/feed/next`
 - **Interaction**: `POST http://localhost:18000/interactions`
+
+Если задан `API_SERVICE_TOKEN`, добавь заголовок:
+
+```bash
+-H "X-API-Token: <token>"
+```
 
 Пример:
 
@@ -318,5 +343,4 @@ curl -X POST "http://localhost:18000/users/telegram/upsert" \
 - Деплой:
   - либо на удалённый сервер,
   - либо развёртывание локально (docker‑compose/инструкция по запуску) для демонстрации.
-
 

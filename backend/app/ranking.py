@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import math
 import uuid
+from typing import Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -17,7 +20,7 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def _field_filled(value: object | None) -> bool:
+def _field_filled(value: Optional[object]) -> bool:
     if value is None:
         return False
     if isinstance(value, str):
@@ -25,23 +28,12 @@ def _field_filled(value: object | None) -> bool:
     return True
 
 
-def compute_primary_score(viewer: Profile, candidate: Profile, photo_count: int = 0) -> float:
+def compute_profile_quality_score(candidate: Profile, photo_count: int = 0) -> float:
     """
-    Level 1: based on profile data + completeness + preference match.
+    Global part of Level 1: profile completeness and media quality.
+    It is safe to persist because it does not depend on a particular viewer.
     Score is normalized to [0, 100].
     """
-    score = 0.0
-
-    # Preferences match (viewer -> candidate)
-    if viewer.pref_gender and candidate.gender and viewer.pref_gender == candidate.gender:
-        score += 20.0
-    if viewer.pref_city and candidate.city and viewer.pref_city.lower() == candidate.city.lower():
-        score += 20.0
-    if candidate.age is not None and viewer.pref_age_min is not None and viewer.pref_age_max is not None:
-        if viewer.pref_age_min <= candidate.age <= viewer.pref_age_max:
-            score += 20.0
-
-    # Completeness (candidate)
     fields = [
         candidate.age,
         candidate.gender,
@@ -55,11 +47,27 @@ def compute_primary_score(viewer: Profile, candidate: Profile, photo_count: int 
     ]
     filled = sum(1 for f in fields if _field_filled(f))
     completeness = filled / len(fields)
-    score += 30.0 * completeness
+    score = 90.0 * completeness
 
     # Photos count (MVP: accept as parameter)
     score += _clamp(10.0 * math.log1p(max(photo_count, 0)), 0.0, 10.0)
 
+    return _clamp(score, 0.0, 100.0)
+
+
+def compute_preference_score(viewer: Profile, candidate: Profile) -> float:
+    """
+    Viewer-specific matching score. This is intentionally not persisted in ratings,
+    because two viewers can rank the same profile differently.
+    """
+    score = 0.0
+    if viewer.pref_gender and candidate.gender and viewer.pref_gender == candidate.gender:
+        score += 35.0
+    if viewer.pref_city and candidate.city and viewer.pref_city.lower() == candidate.city.lower():
+        score += 30.0
+    if candidate.age is not None and viewer.pref_age_min is not None and viewer.pref_age_max is not None:
+        if viewer.pref_age_min <= candidate.age <= viewer.pref_age_max:
+            score += 35.0
     return _clamp(score, 0.0, 100.0)
 
 
@@ -99,8 +107,19 @@ def compute_combined_score(primary: float, behavioral: float) -> float:
     return _clamp(score, 0.0, 100.0)
 
 
-def upsert_rating_for_pair(db: Session, *, viewer_profile: Profile, candidate_profile: Profile) -> Rating:
-    primary = compute_primary_score(viewer_profile, candidate_profile)
+def compute_feed_score(viewer: Profile, candidate: Profile, rating: Optional[Rating]) -> float:
+    """
+    Final score used for one viewer's feed: global profile quality/behavior plus
+    viewer-specific preferences. Kept outside the ratings table to avoid stale,
+    cross-user score pollution.
+    """
+    global_score = float(rating.combined_score) if rating is not None else compute_profile_quality_score(candidate)
+    preference_score = compute_preference_score(viewer, candidate)
+    return _clamp(0.55 * preference_score + 0.45 * global_score, 0.0, 100.0)
+
+
+def upsert_rating_snapshot(db: Session, *, candidate_profile: Profile) -> Rating:
+    primary = compute_profile_quality_score(candidate_profile)
     behavioral = compute_behavioral_score(db, candidate_profile.id)
     combined = compute_combined_score(primary, behavioral)
 
@@ -119,3 +138,10 @@ def upsert_rating_for_pair(db: Session, *, viewer_profile: Profile, candidate_pr
         rating.combined_score = combined
     return rating
 
+
+def upsert_rating_for_pair(db: Session, *, viewer_profile: Profile, candidate_profile: Profile) -> Rating:
+    """
+    Backward-compatible wrapper. The persisted snapshot is intentionally global;
+    viewer_profile is ignored to keep ratings stable across users.
+    """
+    return upsert_rating_snapshot(db, candidate_profile=candidate_profile)

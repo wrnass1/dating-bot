@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,7 +10,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str
     api_base_url: str = "http://api:8000"
+    api_service_token: Optional[str] = None
 
 
 settings = Settings()
-

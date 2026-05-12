@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 
@@ -52,7 +54,7 @@ async def main() -> None:
 
     bot = Bot(token=settings.telegram_bot_token)
     dp = Dispatcher()
-    api = ApiClient(settings.api_base_url)
+    api = ApiClient(settings.api_base_url, settings.api_service_token)
 
     # If the bot was down/restarted, Telegram can have pending updates.
     # Dropping them prevents "duplicate" processing after restarts during development.
@@ -540,4 +542,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

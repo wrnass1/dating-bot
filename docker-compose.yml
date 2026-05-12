@@ -23,6 +23,10 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://dating:dating@postgres:5432/dating}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+      API_SERVICE_TOKEN: ${API_SERVICE_TOKEN:-}
+      ENABLE_DEV_ENDPOINTS: ${ENABLE_DEV_ENDPOINTS:-false}
       API_HOST: ${API_HOST:-0.0.0.0}
       API_PORT: ${API_PORT:-8000}
     depends_on:
@@ -50,8 +54,26 @@ services:
       - ./.env
     environment:
       API_BASE_URL: ${API_BASE_URL:-http://api:8000}
+      API_SERVICE_TOKEN: ${API_SERVICE_TOKEN:-}
     depends_on:
       - api
+
+  worker:
+    build:
+      context: ./backend
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://dating:dating@postgres:5432/dating}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
+    command: ["celery", "-A", "app.celery_app:celery_app", "worker", "--beat", "--loglevel=INFO"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:

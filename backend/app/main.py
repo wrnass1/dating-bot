@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 import json
 import uuid
+from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import and_, delete, desc, or_, select
+from fastapi import Depends, FastAPI, Header, HTTPException
+from sqlalchemy import delete, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
 from app.models import Interaction, Match, Profile, Rating, User
-from app.ranking import upsert_rating_for_pair
+from app.ranking import compute_feed_score, upsert_rating_snapshot
 from app.schemas import (
     DevResetUserStateIn,
     DevResetUserStateOut,
@@ -44,7 +48,12 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/users/telegram/upsert", response_model=TelegramUserUpsertOut)
+def require_service_token(x_api_token: Optional[str] = Header(default=None)) -> None:
+    if settings.api_service_token and x_api_token != settings.api_service_token:
+        raise HTTPException(status_code=401, detail="Invalid API token")
+
+
+@app.post("/users/telegram/upsert", response_model=TelegramUserUpsertOut, dependencies=[Depends(require_service_token)])
 def upsert_telegram_user(payload: TelegramUserUpsertIn, db: Session = Depends(get_db)) -> TelegramUserUpsertOut:
     existing = db.scalar(select(User).where(User.telegram_id == payload.telegram_id))
     if existing is None:
@@ -55,7 +64,14 @@ def upsert_telegram_user(payload: TelegramUserUpsertIn, db: Session = Depends(ge
             language=payload.language,
         )
         db.add(user)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing = db.scalar(select(User).where(User.telegram_id == payload.telegram_id))
+            if existing is None:
+                raise
+            return TelegramUserUpsertOut(user_id=str(existing.id), is_new=False)
         db.refresh(user)
         return TelegramUserUpsertOut(user_id=str(user.id), is_new=True)
 
@@ -93,7 +109,7 @@ def _get_or_create_profile(db: Session, user: User) -> Profile:
     return prof
 
 
-@app.post("/profiles/upsert", response_model=ProfileOut)
+@app.post("/profiles/upsert", response_model=ProfileOut, dependencies=[Depends(require_service_token)])
 def upsert_profile(payload: ProfileUpsertIn, db: Session = Depends(get_db)) -> ProfileOut:
     user = _get_user_by_telegram(db, payload.telegram_id)
     prof = _get_or_create_profile(db, user)
@@ -117,6 +133,11 @@ def upsert_profile(payload: ProfileUpsertIn, db: Session = Depends(get_db)) -> P
     db.add(prof)
     db.commit()
     db.refresh(prof)
+    try:
+        r = _get_redis()
+        r.delete(_feed_key(user.id), _feed_current_key(user.id), _feed_meta_key(user.id))
+    except Exception:
+        pass
     return ProfileOut(
         profile_id=str(prof.id),
         user_id=str(prof.user_id),
@@ -133,7 +154,7 @@ def upsert_profile(payload: ProfileUpsertIn, db: Session = Depends(get_db)) -> P
     )
 
 
-@app.get("/profiles/by_telegram/{telegram_id}", response_model=ProfileOut)
+@app.get("/profiles/by_telegram/{telegram_id}", response_model=ProfileOut, dependencies=[Depends(require_service_token)])
 def get_profile_by_telegram(telegram_id: int, db: Session = Depends(get_db)) -> ProfileOut:
     user = _get_user_by_telegram(db, telegram_id)
     prof = db.scalar(select(Profile).where(Profile.user_id == user.id))
@@ -167,11 +188,23 @@ def _feed_key(user_id: uuid.UUID) -> str:
     return f"user:{user_id}:feed"
 
 
+def _feed_current_key(user_id: uuid.UUID) -> str:
+    return f"user:{user_id}:feed:current"
+
+
 def _feed_meta_key(user_id: uuid.UUID) -> str:
     return f"user:{user_id}:feed:meta"
 
 
-def _build_feed_batch(db: Session, *, viewer: Profile, batch_size: int = 10) -> list[str]:
+def _set_feed_ttl(r, user_id: uuid.UUID) -> None:
+    ttl = settings.feed_cache_ttl_seconds
+    r.expire(_feed_key(user_id), ttl)
+    r.expire(_feed_current_key(user_id), ttl)
+    r.expire(_feed_meta_key(user_id), ttl)
+
+
+def _build_feed_batch(db: Session, *, viewer: Profile, batch_size: Optional[int] = None) -> list[str]:
+    batch_size = batch_size or settings.feed_batch_size
     # Candidates: active profiles excluding viewer + not yet interacted by viewer.
     interacted_subq = select(Interaction.to_profile_id).where(Interaction.from_user_id == viewer.user_id).subquery()
 
@@ -182,51 +215,47 @@ def _build_feed_batch(db: Session, *, viewer: Profile, batch_size: int = 10) -> 
             Profile.user_id != viewer.user_id,
             Profile.id.not_in(select(interacted_subq.c.to_profile_id)),
         )
-        .limit(200)
+        .limit(max(batch_size * 20, 200))
     ).all()
 
     if not candidates:
         return []
 
-    # Upsert ratings for candidates relative to viewer, then select top by combined score.
+    # Upsert global rating snapshots, then sort in memory by viewer-specific feed score.
+    ratings_by_profile: dict[uuid.UUID, Rating] = {}
     for cand in candidates:
-        upsert_rating_for_pair(db, viewer_profile=viewer, candidate_profile=cand)
+        ratings_by_profile[cand.id] = upsert_rating_snapshot(db, candidate_profile=cand)
     db.commit()
 
-    top_ids = db.scalars(
-        select(Profile.id)
-        .join(Rating, Rating.profile_id == Profile.id)
-        .where(Profile.id.in_([c.id for c in candidates]))
-        .order_by(desc(Rating.combined_score), desc(Rating.updated_at))
-        .limit(batch_size)
-    ).all()
-
-    return [str(x) for x in top_ids]
+    ranked = sorted(
+        candidates,
+        key=lambda cand: compute_feed_score(viewer, cand, ratings_by_profile.get(cand.id)),
+        reverse=True,
+    )
+    return [str(x.id) for x in ranked[:batch_size]]
 
 
-@app.post("/feed/next", response_model=FeedProfileOut)
-def feed_next(payload: FeedNextIn, db: Session = Depends(get_db)) -> FeedProfileOut:
-    viewer = _viewer_profile_or_400(db, payload.telegram_id)
-    r = _get_redis()
+def _load_feed_profile(db: Session, profile_id: str) -> Optional[Profile]:
+    try:
+        pid = uuid.UUID(profile_id)
+    except Exception:
+        return None
+    return db.scalar(select(Profile).where(Profile.id == pid, Profile.is_active.is_(True)))
 
-    key = _feed_key(viewer.user_id)
-    profile_id = r.lpop(key)
-    if profile_id is None:
-        batch = _build_feed_batch(db, viewer=viewer, batch_size=10)
-        if not batch:
-            raise HTTPException(status_code=404, detail="No profiles found")
-        r.rpush(key, *batch)
-        r.set(_feed_meta_key(viewer.user_id), json.dumps({"batch_size": len(batch)}))
-        profile_id = r.lpop(key)
 
-    pid = uuid.UUID(profile_id)
-    prof = db.scalar(select(Profile).where(Profile.id == pid))
-    if prof is None:
-        raise HTTPException(status_code=404, detail="Profile not found")
+def _has_interacted(db: Session, *, viewer: Profile, target: Profile) -> bool:
+    return (
+        db.scalar(
+            select(Interaction.id).where(
+                Interaction.from_user_id == viewer.user_id,
+                Interaction.to_profile_id == target.id,
+            )
+        )
+        is not None
+    )
 
-    rating = db.scalar(select(Rating).where(Rating.profile_id == prof.id))
-    combined = float(rating.combined_score) if rating is not None else 0.0
 
+def _profile_to_feed_out(viewer: Profile, prof: Profile, rating: Optional[Rating]) -> FeedProfileOut:
     return FeedProfileOut(
         profile_id=str(prof.id),
         user_id=str(prof.user_id),
@@ -236,15 +265,45 @@ def feed_next(payload: FeedNextIn, db: Session = Depends(get_db)) -> FeedProfile
         city=prof.city,
         interests=prof.interests,
         about=prof.about,
-        combined_score=combined,
+        combined_score=compute_feed_score(viewer, prof, rating),
     )
 
 
-@app.post("/interactions", response_model=InteractionOut)
-def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) -> InteractionOut:
-    if payload.action not in ("like", "skip"):
-        raise HTTPException(status_code=400, detail="action must be like|skip")
+@app.post("/feed/next", response_model=FeedProfileOut, dependencies=[Depends(require_service_token)])
+def feed_next(payload: FeedNextIn, db: Session = Depends(get_db)) -> FeedProfileOut:
+    viewer = _viewer_profile_or_400(db, payload.telegram_id)
+    r = _get_redis()
 
+    key = _feed_key(viewer.user_id)
+    current_key = _feed_current_key(viewer.user_id)
+
+    for _ in range(settings.feed_batch_size + 3):
+        profile_id = r.get(current_key)
+        if profile_id is None:
+            profile_id = r.lpop(key)
+            if profile_id is None:
+                batch = _build_feed_batch(db, viewer=viewer)
+                if not batch:
+                    raise HTTPException(status_code=404, detail="No profiles found")
+                r.rpush(key, *batch)
+                r.set(_feed_meta_key(viewer.user_id), json.dumps({"batch_size": len(batch)}))
+                _set_feed_ttl(r, viewer.user_id)
+                profile_id = r.lpop(key)
+            if profile_id is not None:
+                r.set(current_key, profile_id, ex=settings.feed_cache_ttl_seconds)
+
+        prof = _load_feed_profile(db, str(profile_id))
+        if prof is not None and not _has_interacted(db, viewer=viewer, target=prof):
+            rating = db.scalar(select(Rating).where(Rating.profile_id == prof.id))
+            return _profile_to_feed_out(viewer, prof, rating)
+
+        r.delete(current_key)
+
+    raise HTTPException(status_code=404, detail="No profiles found")
+
+
+@app.post("/interactions", response_model=InteractionOut, dependencies=[Depends(require_service_token)])
+def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) -> InteractionOut:
     user = _get_user_by_telegram(db, payload.telegram_id)
     viewer = db.scalar(select(Profile).where(Profile.user_id == user.id))
     if viewer is None or not viewer.is_active:
@@ -269,8 +328,10 @@ def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) ->
     else:
         existing.action = payload.action
 
+    db.flush()
+
     # Update target rating snapshot
-    upsert_rating_for_pair(db, viewer_profile=viewer, candidate_profile=target)
+    upsert_rating_snapshot(db, candidate_profile=target)
 
     is_match = False
     if payload.action == "like":
@@ -288,11 +349,22 @@ def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) ->
                 db.add(Match(user_a_id=a, user_b_id=b))
             is_match = True
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        is_match = payload.action == "like"
+    try:
+        r = _get_redis()
+        current_key = _feed_current_key(viewer.user_id)
+        if r.get(current_key) == str(target.id):
+            r.delete(current_key)
+    except Exception:
+        pass
     return InteractionOut(ok=True, is_match=is_match)
 
 
-@app.post("/feed/action", response_model=FeedActionOut)
+@app.post("/feed/action", response_model=FeedActionOut, dependencies=[Depends(require_service_token)])
 def feed_action(payload: FeedActionIn, db: Session = Depends(get_db)) -> FeedActionOut:
     """
     Convenience endpoint for the bot UI: record like/skip and return next feed card.
@@ -308,7 +380,7 @@ def feed_action(payload: FeedActionIn, db: Session = Depends(get_db)) -> FeedAct
     return FeedActionOut(ok=bool(res.ok), is_match=bool(res.is_match), next=nxt)
 
 
-@app.post("/dev/reset_user_state", response_model=DevResetUserStateOut)
+@app.post("/dev/reset_user_state", response_model=DevResetUserStateOut, dependencies=[Depends(require_service_token)])
 def dev_reset_user_state(payload: DevResetUserStateIn, db: Session = Depends(get_db)) -> DevResetUserStateOut:
     """
     Dev helper: clear user's swipe history and cached feed.
@@ -316,6 +388,9 @@ def dev_reset_user_state(payload: DevResetUserStateIn, db: Session = Depends(get
     - deletes matches involving the user
     - clears Redis feed list for this user
     """
+    if not settings.enable_dev_endpoints:
+        raise HTTPException(status_code=404, detail="Not found")
+
     user = _get_user_by_telegram(db, payload.telegram_id)
 
     deleted_interactions = db.execute(delete(Interaction).where(Interaction.from_user_id == user.id)).rowcount or 0
@@ -328,6 +403,7 @@ def dev_reset_user_state(payload: DevResetUserStateIn, db: Session = Depends(get
     try:
         r = _get_redis()
         r.delete(_feed_key(user.id))
+        r.delete(_feed_current_key(user.id))
         r.delete(_feed_meta_key(user.id))
     except Exception:
         pass

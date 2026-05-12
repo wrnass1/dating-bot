@@ -74,6 +74,10 @@ ratings {
   updated_at TIMESTAMP
 }
 
+%% Stage 4 note:
+%% ratings stores a global profile snapshot only. Viewer-specific preference
+%% scoring is computed online for the feed and is not persisted in ratings.
+
 referrals {
   id UUID
   inviter_id UUID

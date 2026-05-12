@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import httpx
 
 
 class ApiClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, service_token: str | None = None) -> None:
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(base_url=self._base_url, timeout=10.0)
+        headers = {"X-API-Token": service_token} if service_token else None
+        self._client = httpx.AsyncClient(base_url=self._base_url, timeout=10.0, headers=headers)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -59,4 +62,3 @@ class ApiClient:
         )
         resp.raise_for_status()
         return resp.json()
-
