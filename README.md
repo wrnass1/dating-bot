@@ -1,7 +1,5 @@
 ## Техническое задание: Dating бот
 
-## Запуск (этап 4: бот + API + Redis + Celery)
-
 ### Что реализовано
 - **Bot**: `/start`, `/help`, `/menu`, `/profile`, `/me`, `/feed`, лайк/скип, уведомление о взаимном лайке.
 - **Backend API**: регистрация Telegram-пользователей, анкеты, лента, interactions, matches.
