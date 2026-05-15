@@ -4,13 +4,15 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.exceptions import TelegramNetworkError
+from aiogram.fsm.storage.redis import RedisStorage
 import httpx
 from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
     CallbackQuery,
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -35,25 +37,35 @@ class ProfileWizard(StatesGroup):
     pref_age_min = State()
     pref_age_max = State()
     pref_city = State()
+    photo = State()
 
 
-def _format_welcome(is_new: bool) -> str:
+def _format_welcome(*, is_new: bool, has_profile: bool) -> str:
+    if has_profile:
+        return (
+            "С возвращением! Твоя анкета на месте — ничего заново заполнять не нужно.\n\n"
+            "/me — посмотреть анкету\n"
+            "/feed — лента\n"
+            "/profile — изменить данные"
+        )
     if is_new:
         return (
             "Привет! Я тебя зарегистрировал.\n\n"
-            "Команды:\n"
-            "/profile — создать/обновить анкету\n"
-            "/me — показать мою анкету\n"
-            "/feed — лента анкет"
+            "Создай анкету: /profile\n"
+            "Потом открой /feed"
         )
-    return "С возвращением! Ты уже зарегистрирован(а)."
+    return (
+        "С возвращением! Анкета ещё не заполнена.\n\n"
+        "Начни с /profile — в конце попросим фото."
+    )
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     bot = Bot(token=settings.telegram_bot_token)
-    dp = Dispatcher()
+    storage = RedisStorage.from_url(settings.redis_url)
+    dp = Dispatcher(storage=storage)
     api = ApiClient(settings.api_base_url, settings.api_service_token)
 
     # If the bot was down/restarted, Telegram can have pending updates.
@@ -110,19 +122,54 @@ async def main() -> None:
             ]
         )
 
-    # Telegram "menu commands" (the built-in command list near the input field).
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Регистрация"),
-            BotCommand(command="help", description="Помощь и список команд"),
-            BotCommand(command="menu", description="Меню кнопок"),
-            BotCommand(command="profile", description="Создать/обновить анкету"),
-            BotCommand(command="me", description="Показать мою анкету"),
-            BotCommand(command="feed", description="Лента анкет"),
-            BotCommand(command="ping", description="Проверка: pong"),
-        ],
-        scope=BotCommandScopeDefault(),
-    )
+    async def _download_bytes(url: str) -> bytes:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.content
+
+    def _pick_main_photo(photos: list[dict]) -> dict | None:
+        if not photos:
+            return None
+        for p in photos:
+            if p.get("is_main"):
+                return p
+        return photos[0]
+
+    async def _answer_profile_with_main_photo(
+        message: Message,
+        text: str,
+        photos: list[dict],
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        main_photo = _pick_main_photo(photos)
+        if not main_photo:
+            await safe_answer(message, text, reply_markup=reply_markup)
+            return
+        try:
+            content = await api.download_profile_photo(photo_id=str(main_photo["photo_id"]))
+            filename = f'{main_photo.get("photo_id") or "photo"}.jpg'
+            await message.answer_photo(
+                photo=BufferedInputFile(content, filename=filename),
+                caption=text,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            logger.exception("Failed to send profile photo")
+            await safe_answer(message, text, reply_markup=reply_markup)
+
+    bot_commands = [
+        BotCommand(command="start", description="Регистрация"),
+        BotCommand(command="help", description="Помощь и список команд"),
+        BotCommand(command="menu", description="Меню кнопок"),
+        BotCommand(command="profile", description="Создать/обновить анкету"),
+        BotCommand(command="me", description="Показать мою анкету"),
+        BotCommand(command="feed", description="Лента анкет"),
+        BotCommand(command="ping", description="Проверка: pong"),
+    ]
+    if settings.enable_dev_endpoints:
+        bot_commands.append(BotCommand(command="reset", description="Сброс лайков и ленты (тест)"))
+    await bot.set_my_commands(bot_commands, scope=BotCommandScopeDefault())
 
     def _main_menu_kb() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -142,11 +189,13 @@ async def main() -> None:
         await safe_answer(message, "Меню:", reply_markup=_main_menu_kb())
 
     @dp.message(Command("start"))
-    async def start(message: Message) -> None:
+    async def start(message: Message, state: FSMContext) -> None:
         tg = message.from_user
         if tg is None:
             await safe_answer(message, "Не смог прочитать данные пользователя Telegram.")
             return
+
+        await state.clear()
 
         try:
             result = await api.upsert_telegram_user(
@@ -160,7 +209,13 @@ async def main() -> None:
             await safe_answer(message, "Ошибка регистрации. Попробуй ещё раз позже.")
             return
 
-        await safe_answer(message, _format_welcome(bool(result.get("is_new"))))
+        await safe_answer(
+            message,
+            _format_welcome(
+                is_new=bool(result.get("is_new")),
+                has_profile=bool(result.get("has_profile")),
+            ),
+        )
         await _show_menu(message)
 
     @dp.message(Command("menu"))
@@ -169,15 +224,80 @@ async def main() -> None:
 
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
-        await safe_answer(
-            message,
+        text = (
             "Команды:\n"
             "/start — регистрация\n"
             "/profile — создать/обновить анкету\n"
             "/me — показать мою анкету\n"
             "/feed — лента анкет\n"
-            "/help — помощь"
+            "/help — помощь\n\n"
+            "Фото добавляется в конце заполнения анкеты (/profile)."
         )
+        if settings.enable_dev_endpoints:
+            text += (
+                "\n\n/reset — сбросить лайки/скипы, мэтчи и кэш ленты "
+                "(анкета остаётся). Для повторного теста сделай /reset на обоих аккаунтах."
+            )
+        await safe_answer(message, text)
+
+    @dp.message(Command("reset"))
+    async def reset_cmd(message: Message, state: FSMContext) -> None:
+        if not settings.enable_dev_endpoints:
+            await safe_answer(
+                message,
+                "Команда /reset отключена. В .env установи ENABLE_DEV_ENDPOINTS=true и перезапусти: "
+                "docker compose up -d --build api bot",
+            )
+            return
+        tg = message.from_user
+        if tg is None:
+            return
+        await state.clear()
+        try:
+            result = await api.reset_user_state(telegram_id=tg.id)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                await safe_answer(
+                    message,
+                    "Сброс недоступен: на API тоже должен быть ENABLE_DEV_ENDPOINTS=true.",
+                )
+                return
+            logger.exception("Failed to reset user state")
+            await safe_answer(message, "Не удалось сбросить состояние. Попробуй позже.")
+            return
+        except Exception:
+            logger.exception("Failed to reset user state")
+            await safe_answer(message, "Не удалось сбросить состояние. Попробуй позже.")
+            return
+
+        deleted_i = int(result.get("deleted_interactions", 0))
+        deleted_m = int(result.get("deleted_matches", 0))
+        await safe_answer(
+            message,
+            "Готово. Сброшено:\n"
+            f"- лайков/скипов: {deleted_i}\n"
+            f"- мэтчей: {deleted_m}\n\n"
+            "Анкета сохранена. Можно снова открыть /feed.",
+        )
+
+    @dp.message(StateFilter(None), F.photo)
+    async def photo_upload(message: Message) -> None:
+        tg = message.from_user
+        if tg is None:
+            return
+        is_main = bool(message.caption and "main" in message.caption.lower())
+        photo = message.photo[-1]
+        try:
+            downloaded = await bot.download(photo)
+            if downloaded is None:
+                raise RuntimeError("empty download")
+            content = downloaded.getvalue()
+            await api.upload_profile_photo(telegram_id=tg.id, content=content, is_main=is_main)
+        except Exception:
+            logger.exception("Failed to upload profile photo")
+            await safe_answer(message, "Не удалось загрузить фото. Сначала создай анкету через /profile.")
+            return
+        await safe_answer(message, "Фото сохранено в S3/MinIO." + (" Установлено как главное." if is_main else ""))
 
     @dp.message(F.text == "/ping")
     async def ping(message: Message) -> None:
@@ -206,15 +326,37 @@ async def main() -> None:
             f"- Возраст: {prof.get('pref_age_min')}–{prof.get('pref_age_max')}\n"
             f"- Город: {prof.get('pref_city')}\n"
         )
-        await safe_answer(message, text)
+        photos: list[dict] = []
+        try:
+            photos = await api.get_profile_photos(telegram_id=tg.id)
+        except Exception:
+            logger.exception("Failed to fetch profile photos")
+        await _answer_profile_with_main_photo(message, text, photos)
+
+    async def _ensure_registered(message: Message) -> int | None:
+        tg = message.from_user
+        if tg is None:
+            return None
+        try:
+            await api.upsert_telegram_user(
+                telegram_id=tg.id,
+                username=tg.username,
+                first_name=tg.first_name,
+                language=tg.language_code,
+            )
+        except Exception:
+            logger.exception("Failed to register telegram user")
+            await safe_answer(message, "Не удалось зарегистрировать пользователя. Нажми /start и попробуй снова.")
+            return None
+        return tg.id
 
     @dp.message(Command("profile"))
     async def profile_start(message: Message, state: FSMContext) -> None:
-        tg = message.from_user
-        if tg is None:
+        tg_id = await _ensure_registered(message)
+        if tg_id is None:
             return
         await state.clear()
-        await state.update_data(telegram_id=tg.id)
+        await state.update_data(telegram_id=tg_id)
         await state.set_state(ProfileWizard.age)
         await safe_answer(message, "Создаём/обновляем анкету. Сколько тебе лет? (18–120)")
 
@@ -308,19 +450,38 @@ async def main() -> None:
         await state.set_state(ProfileWizard.pref_city)
         await safe_answer(message, "Город партнёра? (можно такой же, как твой)")
 
-    @dp.message(ProfileWizard.pref_city)
-    async def profile_pref_city(message: Message, state: FSMContext) -> None:
-        pref_city = (message.text or "").strip()
-        if not pref_city:
-            await safe_answer(message, "Введи город текстом.")
+    async def _finalize_profile(
+        message: Message,
+        state: FSMContext,
+        *,
+        photo_bytes: bytes | None = None,
+    ) -> None:
+        tg = message.from_user
+        if tg is None:
             return
         data = await state.get_data()
-        telegram_id = int(data["telegram_id"])
+        telegram_id = tg.id
         fields = {k: v for k, v in data.items() if k != "telegram_id"}
-        fields["pref_city"] = pref_city
 
         try:
+            await api.upsert_telegram_user(
+                telegram_id=telegram_id,
+                username=tg.username,
+                first_name=tg.first_name,
+                language=tg.language_code,
+            )
             await api.upsert_profile(telegram_id=telegram_id, **fields)
+            if photo_bytes is not None:
+                await api.upload_profile_photo(telegram_id=telegram_id, content=photo_bytes, is_main=True)
+        except httpx.HTTPStatusError as e:
+            logger.exception("Failed to upsert profile")
+            detail = ""
+            try:
+                detail = e.response.json().get("detail", "")
+            except Exception:
+                detail = e.response.text
+            await safe_answer(message, f"Не получилось сохранить анкету: {detail or e.response.status_code}")
+            return
         except Exception:
             logger.exception("Failed to upsert profile")
             await safe_answer(message, "Не получилось сохранить анкету. Попробуй позже.")
@@ -328,7 +489,40 @@ async def main() -> None:
         finally:
             await state.clear()
 
-        await safe_answer(message, "Анкета сохранена! Теперь можно открыть /feed.")
+        suffix = " Фото добавлено." if photo_bytes is not None else ""
+        await safe_answer(message, f"Анкета сохранена!{suffix} Теперь можно открыть /feed.")
+
+    @dp.message(ProfileWizard.pref_city)
+    async def profile_pref_city(message: Message, state: FSMContext) -> None:
+        pref_city = (message.text or "").strip()
+        if not pref_city:
+            await safe_answer(message, "Введи город текстом.")
+            return
+        await state.update_data(pref_city=pref_city)
+        await state.set_state(ProfileWizard.photo)
+        await safe_answer(
+            message,
+            "Последний шаг: отправь своё фото (сжатое изображение в чат).\n"
+            "Или напиши /skip, чтобы сохранить анкету без фото.",
+        )
+
+    @dp.message(ProfileWizard.photo, F.photo)
+    async def profile_wizard_photo(message: Message, state: FSMContext) -> None:
+        photo = message.photo[-1]
+        try:
+            downloaded = await bot.download(photo)
+            if downloaded is None:
+                raise RuntimeError("empty download")
+            content = downloaded.getvalue()
+        except Exception:
+            logger.exception("Failed to download profile photo")
+            await safe_answer(message, "Не удалось получить фото. Попробуй отправить ещё раз.")
+            return
+        await _finalize_profile(message, state, photo_bytes=content)
+
+    @dp.message(ProfileWizard.photo, Command("skip"))
+    async def profile_wizard_skip_photo(message: Message, state: FSMContext) -> None:
+        await _finalize_profile(message, state, photo_bytes=None)
 
     def _feed_kb(profile_id: str, target_telegram_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -379,11 +573,15 @@ async def main() -> None:
         except Exception as e:
             await safe_answer(message, _format_feed_error(e))
             return
-        await safe_answer(
-            message,
-            _format_feed_card(card),
-            reply_markup=_feed_kb(card["profile_id"], int(card["telegram_id"])),
-        )
+        feed_text = _format_feed_card(card)
+        reply_markup = _feed_kb(card["profile_id"], int(card["telegram_id"]))
+        photos: list[dict] = []
+        try:
+            photos = await api.get_profile_photos(telegram_id=int(card["telegram_id"]))
+        except Exception:
+            logger.exception("Failed to fetch photos for feed card")
+
+        await _answer_profile_with_main_photo(message, feed_text, photos, reply_markup=reply_markup)
 
     @dp.message(Command("feed"))
     async def feed(message: Message) -> None:

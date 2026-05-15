@@ -62,3 +62,37 @@ class ApiClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    async def upload_profile_photo(
+        self,
+        *,
+        telegram_id: int,
+        content: bytes,
+        filename: str = "photo.jpg",
+        is_main: bool = False,
+    ) -> dict:
+        resp = await self._client.post(
+            "/profiles/photos",
+            params={"telegram_id": telegram_id, "is_main": is_main},
+            files={"file": (filename, content, "image/jpeg")},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_profile_photos(self, *, telegram_id: int) -> list[dict]:
+        resp = await self._client.get(f"/profiles/photos/{telegram_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def download_profile_photo(self, *, photo_id: str) -> bytes:
+        resp = await self._client.get(f"/profiles/photos/download/{photo_id}")
+        resp.raise_for_status()
+        return resp.content
+
+    async def reset_user_state(self, *, telegram_id: int) -> dict:
+        resp = await self._client.post(
+            "/dev/reset_user_state",
+            json={"telegram_id": telegram_id},
+        )
+        resp.raise_for_status()
+        return resp.json()

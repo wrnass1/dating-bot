@@ -17,7 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Interaction, Profile, Rating
+from app.models import Interaction, Profile, Rating, User
 
 
 class FakeRedis:
@@ -80,6 +80,7 @@ def make_client(monkeypatch):
     fake_redis = FakeRedis()
     app.dependency_overrides[get_db] = override_get_db
     monkeypatch.setattr("app.main._get_redis", lambda: fake_redis)
+    monkeypatch.setattr("app.main.publish_event", lambda *args, **kwargs: None)
 
     client = TestClient(app)
     return client, TestingSessionLocal, fake_redis
@@ -153,5 +154,26 @@ def test_mutual_like_creates_match_and_updates_behavioral_rating(monkeypatch):
         assert interaction_count == 2
         assert rating is not None
         assert rating.behavioral_score > 0
+    finally:
+        db.close()
+
+
+def test_referral_increases_inviter_rating(monkeypatch):
+    client, SessionLocal, _ = make_client(monkeypatch)
+    create_user_profile(client, 301, age=27, gender="male", city="Moscow")
+    create_user_profile(client, 302, age=24, gender="female", city="Moscow")
+
+    client.post(
+        "/referrals/apply",
+        json={"inviter_telegram_id": 301, "invitee_telegram_id": 302},
+    ).raise_for_status()
+
+    db = SessionLocal()
+    try:
+        inviter_profile = db.scalar(select(Profile).join(User, User.id == Profile.user_id).where(User.telegram_id == 301))
+        assert inviter_profile is not None
+        rating = db.scalar(select(Rating).where(Rating.profile_id == inviter_profile.id))
+        assert rating is not None
+        assert rating.combined_score > 0
     finally:
         db.close()

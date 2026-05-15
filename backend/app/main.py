@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import uuid
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
-from sqlalchemy import delete, or_, select
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Response
+from prometheus_fastapi_instrumentator import Instrumentator
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine, get_db
-from app.models import Interaction, Match, Profile, Rating, User
+from app.logging_middleware import AccessLogMiddleware
+from app.models import Dialog, Interaction, Match, Profile, ProfilePhoto, Rating, Referral, User
+from app.mq import publish_event
 from app.ranking import compute_feed_score, upsert_rating_snapshot
 from app.schemas import (
     DevResetUserStateIn,
@@ -22,11 +28,16 @@ from app.schemas import (
     InteractionIn,
     InteractionOut,
     ProfileOut,
+    ProfilePhotoOut,
     ProfileUpsertIn,
+    ReferralApplyIn,
     TelegramUserUpsertIn,
     TelegramUserUpsertOut,
 )
 from app.settings import settings
+from app import storage as photo_storage
+
+logger = logging.getLogger("api")
 
 try:
     import redis  # type: ignore
@@ -35,12 +46,20 @@ except Exception:  # pragma: no cover
 
 
 app = FastAPI(title="Dating Bot API", version="0.1.0")
+app.add_middleware(AccessLogMiddleware)
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=True)
 
 
 @app.on_event("startup")
 def _startup() -> None:
-    # For stage 2-3 we keep it simple: auto-create the table set.
+    logging.basicConfig(level=logging.INFO)
     Base.metadata.create_all(bind=engine)
+    if photo_storage.is_storage_configured():
+        try:
+            photo_storage.ensure_bucket()
+            logger.info("S3/MinIO bucket ready: %s", settings.s3_bucket)
+        except Exception:
+            logger.exception("Failed to initialize S3/MinIO bucket")
 
 
 @app.get("/health")
@@ -71,9 +90,17 @@ def upsert_telegram_user(payload: TelegramUserUpsertIn, db: Session = Depends(ge
             existing = db.scalar(select(User).where(User.telegram_id == payload.telegram_id))
             if existing is None:
                 raise
-            return TelegramUserUpsertOut(user_id=str(existing.id), is_new=False)
+            return TelegramUserUpsertOut(
+                user_id=str(existing.id),
+                is_new=False,
+                has_profile=_user_has_profile(db, existing),
+            )
         db.refresh(user)
-        return TelegramUserUpsertOut(user_id=str(user.id), is_new=True)
+        return TelegramUserUpsertOut(
+            user_id=str(user.id),
+            is_new=True,
+            has_profile=False,
+        )
 
     changed = False
     for field in ("username", "first_name", "language"):
@@ -84,7 +111,11 @@ def upsert_telegram_user(payload: TelegramUserUpsertIn, db: Session = Depends(ge
     if changed:
         db.commit()
 
-    return TelegramUserUpsertOut(user_id=str(existing.id), is_new=False)
+    return TelegramUserUpsertOut(
+        user_id=str(existing.id),
+        is_new=False,
+        has_profile=_user_has_profile(db, existing),
+    )
 
 
 def _get_redis():
@@ -100,6 +131,16 @@ def _get_user_by_telegram(db: Session, telegram_id: int) -> User:
     return user
 
 
+def _get_or_create_user_by_telegram(db: Session, telegram_id: int) -> User:
+    user = db.scalar(select(User).where(User.telegram_id == telegram_id))
+    if user is not None:
+        return user
+    user = User(telegram_id=telegram_id)
+    db.add(user)
+    db.flush()
+    return user
+
+
 def _get_or_create_profile(db: Session, user: User) -> Profile:
     prof = db.scalar(select(Profile).where(Profile.user_id == user.id))
     if prof is None:
@@ -109,9 +150,28 @@ def _get_or_create_profile(db: Session, user: User) -> Profile:
     return prof
 
 
+def _profile_is_complete(prof: Profile | None) -> bool:
+    if prof is None:
+        return False
+    return (
+        prof.age is not None
+        and prof.gender is not None
+        and prof.city is not None
+        and prof.pref_gender is not None
+        and prof.pref_age_min is not None
+        and prof.pref_age_max is not None
+        and prof.pref_city is not None
+    )
+
+
+def _user_has_profile(db: Session, user: User) -> bool:
+    prof = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    return _profile_is_complete(prof)
+
+
 @app.post("/profiles/upsert", response_model=ProfileOut, dependencies=[Depends(require_service_token)])
 def upsert_profile(payload: ProfileUpsertIn, db: Session = Depends(get_db)) -> ProfileOut:
-    user = _get_user_by_telegram(db, payload.telegram_id)
+    user = _get_or_create_user_by_telegram(db, payload.telegram_id)
     prof = _get_or_create_profile(db, user)
 
     for field in (
@@ -152,6 +212,95 @@ def upsert_profile(payload: ProfileUpsertIn, db: Session = Depends(get_db)) -> P
         pref_age_max=prof.pref_age_max,
         pref_city=prof.pref_city,
     )
+
+
+@app.post("/profiles/photos", response_model=ProfilePhotoOut, dependencies=[Depends(require_service_token)])
+async def upload_profile_photo(
+    telegram_id: int,
+    file: UploadFile = File(...),
+    is_main: bool = False,
+    db: Session = Depends(get_db),
+) -> ProfilePhotoOut:
+    user = _get_user_by_telegram(db, telegram_id)
+    prof = _get_or_create_profile(db, user)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 5MB)")
+
+    try:
+        storage_key, url = photo_storage.upload_profile_photo(
+            profile_id=str(prof.id),
+            content=content,
+            content_type=file.content_type or "image/jpeg",
+        )
+    except Exception as e:
+        logger.exception("Photo upload failed")
+        raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}") from e
+
+    if is_main:
+        db.execute(update(ProfilePhoto).where(ProfilePhoto.profile_id == prof.id).values(is_main=False))
+
+    photo = ProfilePhoto(profile_id=prof.id, url=url, storage_key=storage_key, is_main=is_main)
+    db.add(photo)
+    db.flush()
+    upsert_rating_snapshot(db, candidate_profile=prof)
+    db.commit()
+    db.refresh(photo)
+    return ProfilePhotoOut(photo_id=str(photo.id), url=photo.url, is_main=bool(photo.is_main))
+
+
+@app.get(
+    "/profiles/photos/{telegram_id}",
+    response_model=list[ProfilePhotoOut],
+    dependencies=[Depends(require_service_token)],
+)
+def list_profile_photos(telegram_id: int, db: Session = Depends(get_db)) -> list[ProfilePhotoOut]:
+    user = _get_user_by_telegram(db, telegram_id)
+    prof = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    if prof is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    photos = db.scalars(select(ProfilePhoto).where(ProfilePhoto.profile_id == prof.id)).all()
+    return [ProfilePhotoOut(photo_id=str(p.id), url=p.url, is_main=bool(p.is_main)) for p in photos]
+
+
+@app.get("/profiles/photos/download/{photo_id}", dependencies=[Depends(require_service_token)])
+async def download_profile_photo(photo_id: str, db: Session = Depends(get_db)) -> Response:
+    try:
+        photo_uuid = uuid.UUID(photo_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid photo_id") from None
+
+    photo = db.scalar(select(ProfilePhoto).where(ProfilePhoto.id == photo_uuid))
+    if photo is None:
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    try:
+        content = await asyncio.to_thread(photo_storage.download_object, storage_key=photo.storage_key)
+    except Exception as e:
+        logger.exception("Failed to download photo")
+        raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}") from e
+
+    return Response(content=content, media_type="image/jpeg")
+
+
+@app.post("/referrals/apply", dependencies=[Depends(require_service_token)])
+def apply_referral(payload: ReferralApplyIn, db: Session = Depends(get_db)) -> dict:
+    inviter = _get_user_by_telegram(db, payload.inviter_telegram_id)
+    invitee = _get_user_by_telegram(db, payload.invitee_telegram_id)
+    if inviter.id == invitee.id:
+        raise HTTPException(status_code=400, detail="Cannot refer yourself")
+    existing = db.scalar(select(Referral).where(Referral.invitee_id == invitee.id))
+    if existing is not None:
+        return {"ok": True, "created": False}
+    db.add(Referral(inviter_id=inviter.id, invitee_id=invitee.id))
+    db.commit()
+    inviter_prof = db.scalar(select(Profile).where(Profile.user_id == inviter.id))
+    if inviter_prof is not None:
+        upsert_rating_snapshot(db, candidate_profile=inviter_prof)
+        db.commit()
+    return {"ok": True, "created": True}
 
 
 @app.get("/profiles/by_telegram/{telegram_id}", response_model=ProfileOut, dependencies=[Depends(require_service_token)])
@@ -334,6 +483,7 @@ def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) ->
     upsert_rating_snapshot(db, candidate_profile=target)
 
     is_match = False
+    match_row: Match | None = None
     if payload.action == "like":
         reverse_like = db.scalar(
             select(Interaction).where(
@@ -344,9 +494,11 @@ def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) ->
         )
         if reverse_like is not None:
             a, b = sorted([viewer.user_id, target.user_id], key=lambda x: str(x))
-            m = db.scalar(select(Match).where(Match.user_a_id == a, Match.user_b_id == b))
-            if m is None:
-                db.add(Match(user_a_id=a, user_b_id=b))
+            match_row = db.scalar(select(Match).where(Match.user_a_id == a, Match.user_b_id == b))
+            if match_row is None:
+                match_row = Match(user_a_id=a, user_b_id=b)
+                db.add(match_row)
+                db.flush()
             is_match = True
 
     try:
@@ -354,6 +506,34 @@ def create_interaction(payload: InteractionIn, db: Session = Depends(get_db)) ->
     except IntegrityError:
         db.rollback()
         is_match = payload.action == "like"
+
+    event_type = "profile_liked" if payload.action == "like" else "profile_skipped"
+    publish_event(
+        event_type,
+        {
+            "telegram_id": payload.telegram_id,
+            "to_profile_id": str(target.id),
+            "action": payload.action,
+        },
+    )
+    if is_match:
+        a, b = sorted([viewer.user_id, target.user_id], key=lambda x: str(x))
+        persisted_match = db.scalar(select(Match).where(Match.user_a_id == a, Match.user_b_id == b))
+        if persisted_match is not None:
+            publish_event(
+                "match_created",
+                {
+                    "match_id": str(persisted_match.id),
+                    "user_a_id": str(persisted_match.user_a_id),
+                    "user_b_id": str(persisted_match.user_b_id),
+                },
+            )
+            existing_dialog = db.scalar(select(Dialog).where(Dialog.match_id == persisted_match.id))
+            if existing_dialog is None:
+                db.add(Dialog(match_id=persisted_match.id))
+                db.commit()
+            publish_event("dialog_started", {"match_id": str(persisted_match.id)})
+
     try:
         r = _get_redis()
         current_key = _feed_current_key(viewer.user_id)

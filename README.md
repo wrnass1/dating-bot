@@ -1,13 +1,18 @@
 ## Техническое задание: Dating бот
 
 ### Что реализовано
-- **Bot**: `/start`, `/help`, `/menu`, `/profile`, `/me`, `/feed`, лайк/скип, уведомление о взаимном лайке.
-- **Backend API**: регистрация Telegram-пользователей, анкеты, лента, interactions, matches.
-- **Ранжирование**: глобальный рейтинг анкеты + персональный feed-score под предпочтения смотрящего.
+- **Bot**: `/start`, `/help`, `/menu`, `/profile`, `/me`, `/feed`, `/photo`, лайк/скип, уведомление о взаимном лайке.
+- **Backend API**: регистрация Telegram-пользователей, анкеты, лента, interactions, matches, загрузка фото.
+- **Ранжирование**: 3 уровня (первичный, поведенческий, комбинированный с referral/recency бонусами).
 - **Redis**: кэш батча ленты и текущей карточки с TTL.
 - **Celery**: периодический пересчёт рейтингов и обслуживание stale feed cache.
-- **БД**: Postgres с индексами и ограничениями целостности.
-- **Тесты**: продуктовые pytest-сценарии для ленты, лайков, мэтчей и рейтинга.
+- **RabbitMQ**: события like/skip/match/dialog → consumer `mq_consumer`.
+- **MinIO (S3)**: хранение фотографий анкет.
+- **Метрики**: Prometheus `/metrics`, access-логи API.
+- **CI**: GitHub Actions (pytest + docker build).
+- **Нагрузка**: JMeter-план `load-test/feed-next.jmx`.
+- **БД**: Postgres (`users`, `profiles`, `profile_photos`, `interactions`, `matches`, `dialogs`, `messages`, `ratings`, `referrals`).
+- **Тесты**: продуктовые pytest-сценарии для ленты, лайков, мэтчей, рейтинга и referral.
 
 ### Быстрый старт
 

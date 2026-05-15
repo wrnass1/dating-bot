@@ -15,6 +15,7 @@ class TelegramUserUpsertIn(BaseModel):
 class TelegramUserUpsertOut(BaseModel):
     user_id: str
     is_new: bool
+    has_profile: bool = False
 
 
 class ProfileUpsertIn(BaseModel):
@@ -104,3 +105,14 @@ class DevResetUserStateOut(BaseModel):
     ok: bool
     deleted_interactions: int
     deleted_matches: int
+
+
+class ProfilePhotoOut(BaseModel):
+    photo_id: str
+    url: str
+    is_main: bool
+
+
+class ReferralApplyIn(BaseModel):
+    invitee_telegram_id: int = Field(ge=1)
+    inviter_telegram_id: int = Field(ge=1)
